@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kindleify"
+version = "0.1.0"
+description = "Re-layout a single-column PDF with margin notes for an e-reader screen, keeping vectors and inlining sidenotes."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "yuliaknut" }]
+dependencies = ["pymupdf>=1.24", "pillow>=10"]
+keywords = ["pdf", "kindle", "e-reader", "tufte", "sidenotes"]
+
+[project.scripts]
+kindleify = "kindleify:main"
+
+[project.urls]
+Repository = "https://github.com/yuliaknut/kindleify"
+
+[tool.setuptools]
+py-modules = ["kindleify"]
