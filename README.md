@@ -46,6 +46,7 @@ uvx --from git+https://github.com/yuliaknut/kindleify kindleify reader.pdf
 ```sh
 kindleify reader.pdf                          # writes reader.kindle.pdf
 kindleify reader.pdf -o out.pdf --device paperwhite
+kindleify reader.pdf --scale 1.3              # body text 30% larger, re-wrapped
 kindleify reader.pdf --dry-run                # print the detected geometry only
 kindleify paper.pdf --no-notes                # drop the margin column instead of inlining it
 kindleify reader.pdf --header-y 50 --split 400  # override detected geometry
@@ -53,8 +54,31 @@ kindleify reader.pdf --header-y 50 --split 400  # override detected geometry
 
 Devices: `kindle` (6", default), `paperwhite`, `oasis`, `scribe`, `kobo`,
 `remarkable`, or `--aspect H/W` for anything else. The device only sets the
-page aspect ratio. The reader scales the page to fit, so the text size you get is
-set by the width of the source text column.
+page aspect ratio. The reader scales the page to fit, so without `--scale` the
+text size you get is set by the width of the source text column.
+
+### Larger text: `--scale`
+
+```sh
+kindleify reader.pdf --scale 1.3
+```
+
+`--scale` re-wraps body paragraphs word by word. Each word is still a clip of
+the source page, so glyphs, kerning, ligatures, bold and italic runs, inline
+code and superscript note marks are untouched; only the line breaks and the
+inter-word spacing are recomputed, and lines are re-justified. Headings and
+other short lines are enlarged by the same factor. Figures, boxes, code
+listings, display math and tables are enlarged only as far as the column allows,
+so they keep their layout. Margin notes follow the body size.
+
+Paragraph boundaries are inferred from the layout (indentation, bullets,
+vertical space, short last lines with sentence punctuation), which is reliable
+on LaTeX output but is a heuristic: expect the occasional early line break at a
+line the source left short. A single token wider than the column, such as a
+long URL, shrinks its own line to fit.
+
+On a 6" Kindle, 1.3 turns 10pt body text into roughly 10pt on screen (from
+about 7.7pt without it); on a Paperwhite, about 11.5pt.
 
 Run with `--dry-run` first on a new document and sanity-check the numbers: the
 header cutoff, the text column, and whether a margin column was detected. Then
@@ -63,6 +87,7 @@ skim the output. Any run on a new template is a draft.
 ## What it handles
 
 - Single text column with justified body text, LaTeX or similar.
+- Enlarging the body text with a real word-level re-wrap (`--scale`).
 - A margin column on the right with sidenotes, asides, and captions.
 - Running headers and footers, including bare page numbers.
 - Figures, shaded boxes, code listings (including line numbers in the left
@@ -76,8 +101,8 @@ skim the output. Any run on a new template is a draft.
 - **Designed brochures and slides.** Full-bleed backgrounds and floating text
   boxes have no column to detect.
 - **Margin notes on the left**, or alternating sides.
-- **Re-flowing the text.** The text size is bounded by the source column width.
-  For a larger size you need a real EPUB conversion, and you lose the layout.
+- **Re-flowing anything but plain paragraphs.** Code, math and tables keep
+  their source line breaks, so they cannot grow beyond the column width.
 - The printed table of contents keeps its old page numbers, since it is part
   of the page image. The PDF bookmarks are correct.
 
