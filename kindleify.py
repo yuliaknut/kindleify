@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import os
 import re
 import statistics
 import sys
@@ -27,7 +28,7 @@ from dataclasses import dataclass, fields
 import pymupdf
 from PIL import Image
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 # Screen aspect ratios (height / width) for common e-readers.
 DEVICES = {
@@ -237,23 +238,30 @@ def collect_items(page, g: Geometry):
     return main, margin
 
 
-def cluster(items, gap_tol, max_h=None):
+def cluster(items, gap_tol, max_h=None, graphic_tol=0.0, text_overlap=0.0):
     """Group items into atomic vertical clusters by y-overlap (plus gap_tol).
     Items taller than max_h (big boxes) are dropped so their contents can still
-    be split at line gaps."""
+    be split at line gaps. graphic_tol lets drawings and images bridge small gaps
+    (arrow ends, box borders) so a diagram made of parts stays one cluster."""
     items = sorted(items, key=lambda i: (i.y0, i.x0))
     clusters = []
     cur = None
     for it in items:
         if max_h is not None and (it.y1 - it.y0) > max_h:
             continue
-        if cur is not None and it.y0 <= cur["y1"] + gap_tol:
+        tol = gap_tol
+        if cur is not None and graphic_tol and (not it.is_text or not cur["last_text"]):
+            tol = max(tol, graphic_tol)
+        elif cur is not None and it.is_text and cur["last_text"]:
+            tol = tol - text_overlap  # a superscript can make neighbouring text lines overlap slightly
+        if cur is not None and it.y0 <= cur["y1"] + tol:
             cur["y1"] = max(cur["y1"], it.y1)
             cur["x0"] = min(cur["x0"], it.x0)
             cur["x1"] = max(cur["x1"], it.x1)
             cur["items"].append(it)
+            cur["last_text"] = cur["last_text"] and it.is_text
         else:
-            cur = {"y0": it.y0, "y1": it.y1, "x0": it.x0, "x1": it.x1, "items": [it]}
+            cur = {"y0": it.y0, "y1": it.y1, "x0": it.x0, "x1": it.x1, "items": [it], "last_text": it.is_text}
             clusters.append(cur)
     return clusters
 
@@ -271,8 +279,9 @@ def _bands(clusters, top_pad, bot_pad, floor):
 def _line_words(line, g: Geometry):
     """Split a rawdict line into words: tight x-extents, text, baseline, fonts."""
     chars = []
+    base = re.sub(r"\d+", "", g.body_font)             # LMSans10 -> LMSans, so LMSans9 counts as body
     for sp in line["spans"]:
-        fam = _font_family(sp["font"])
+        fam = re.sub(r"\d+", "", _font_family(sp["font"]))
         for c in sp["chars"]:
             chars.append((c["c"], c["bbox"], c["origin"][1], sp["size"], fam))
     chars.sort(key=lambda c: c[1][0])
@@ -283,7 +292,7 @@ def _line_words(line, g: Geometry):
             words.append({
                 "x0": min(c[1][0] for c in cur), "x1": max(c[1][2] for c in cur),
                 "text": "".join(c[0] for c in cur),
-                "body_chars": sum(1 for c in cur if c[4] == g.body_font),
+                "body_chars": sum(1 for c in cur if c[4] == base),
                 "max_size": max(c[3] for c in cur),
             })
         cur.clear()
@@ -310,6 +319,13 @@ def build_units(page, g: Geometry, usable_h: float, note_scale: float, keep_note
     """Turn one source page into main-column units and margin-note units."""
     main, margin = collect_items(page, g)
     pno = page.number
+    line_fonts = {}
+    for b in page.get_text("dict")["blocks"]:
+        if b["type"] == 0:
+            for l in b["lines"]:
+                big = max(l["spans"], key=lambda sp: len(sp["text"]))
+                first = next((sp for sp in l["spans"] if sp["text"].strip()), big)
+                line_fonts[(round(l["bbox"][0], 1), round(l["bbox"][1], 1))] = (max(big["size"], first["size"]), big["font"])
     raw_lines = {}
     if max_scale != 1.0:
         for b in page.get_text("rawdict")["blocks"]:
@@ -317,42 +333,114 @@ def build_units(page, g: Geometry, usable_h: float, note_scale: float, keep_note
                 for l in b["lines"]:
                     raw_lines[tuple(round(v, 1) for v in l["bbox"])] = l
 
-    clusters = cluster(main, gap_tol=0.0)
+    clusters = cluster(main, gap_tol=0.0, graphic_tol=8.0, text_overlap=3.0)
     fixed = []
-    for c in clusters:
-        if c["y1"] - c["y0"] > usable_h * 0.6:
-            fixed.extend(cluster(c["items"], gap_tol=0.0, max_h=4 * g.body_size))
+    for gi, c in enumerate(clusters):
+        h = c["y1"] - c["y0"]
+        text_h = sum(it.y1 - it.y0 for it in c["items"] if it.is_text)
+        if h > usable_h * 0.6 and text_h > 0.5 * h:
+            # a tall box of text lines (code listing, long note box): break at line
+            # gaps, but remember the group so it can be kept on one page when it fits
+            for sc in cluster(c["items"], gap_tol=0.0, max_h=4 * g.body_size):
+                sc["group"] = (pno, gi)
+                fixed.append(sc)
         else:
-            fixed.append(c)
+            fixed.append(c)        # diagrams stay whole; if too tall they are scaled to fit
     clusters = sorted(fixed, key=lambda c: c["y0"])
 
     units = []
+    c_items = {}
     for c, (top, bot) in zip(clusters, _bands(clusters, 2.0, 2.0, g.header_y)):
         wide = [(it.x0, it.y0, it.x1, it.y1) for it in c["items"] if it.x1 > g.split + 3]
         left = min(g.col_l, min(it.x0 for it in c["items"]) - 2)
         right = max(g.col_r, max((w[2] for w in wide), default=0) + 3)
         text_items = [it for it in c["items"] if it.is_text]
-        if len(text_items) == 1 and len(c["items"]) == 1 and not wide and max_scale > 1.0:
-            # a lone text line (heading, short display line) gets a tight clip so it
-            # can be enlarged like the body text; body lines are re-wrapped instead
-            right = max(right - (g.col_r - min(g.col_r, text_items[0].x1 + 3)), left + 1)
+        heading = False
+        chapter = False
+        single_row = text_items and len(text_items) == len(c["items"]) and (c["y1"] - c["y0"]) <= 1.6 * max(
+            line_fonts.get((round(it.x0, 1), round(it.y0, 1)), (g.body_size, ""))[0] for it in text_items)
+        if single_row:
+            # one row of text: a heading if its type is larger than the body ("1.1" and
+            # its title are separate lines on the same row; so are run-in headings)
+            fonts = [line_fonts.get((round(it.x0, 1), round(it.y0, 1)), (0, "")) for it in text_items]
+            sz = max(f[0] for f in fonts)
+            heading = sz > g.body_size + 0.6 and not any("Mono" in f[1] for f in fonts)
+            chapter = heading and sz >= 1.8 * g.body_size
+            if heading and not wide and max_scale > 1.0:
+                # a heading gets a tight clip so it can be enlarged like the body text
+                right = max(right - (g.col_r - min(g.col_r, max(it.x1 for it in text_items) + 3)), left + 1)
+        scale = min(max_scale, g.col_w / (right - left))
+        if (bot - top) * scale > usable_h - 2:
+            scale = (usable_h - 2) / (bot - top)          # too tall for a page: shrink to fit
         u = {
             "type": "main", "pno": pno, "top": top, "bot": bot, "left": left, "right": right,
-            "scale": min(max_scale, g.col_w / (right - left)), "wide": wide,
+            "scale": scale, "heading": heading, "chapter": chapter, "wide": wide, "group": c.get("group"),
             "y0": c["y0"], "y1": c["y1"], "x0min": min(it.x0 for it in c["items"]),
             "ntext": len(text_items), "text_x1": max((it.x1 for it in text_items), default=None),
             "graphics": len(text_items) != len(c["items"]), "words": None,
         }
-        # single plain text line: keep its words so paragraphs can be re-wrapped
-        if raw_lines and u["ntext"] == 1 and not u["graphics"] and not wide \
-                and u["x0min"] >= g.col_l and (c["y1"] - c["y0"]) <= 1.6 * g.body_size:
-            it = text_items[0]
-            rl = raw_lines.get((round(it.x0, 1), round(it.y0, 1), round(it.x1, 1), round(it.y1, 1)))
-            if rl is not None:
-                words, baseline = _line_words(rl, g)
-                if words and all(w["max_size"] <= g.body_size + 0.6 for w in words):
+        # one row of plain text: keep its words so paragraphs can be re-wrapped. A row
+        # may be several extraction "lines" sitting side by side (a run-in italic
+        # heading followed by regular text); merge them when they are adjacent.
+        row_ok = (raw_lines and not u["graphics"] and not wide and not heading
+                  and u["x0min"] >= g.col_l and (c["y1"] - c["y0"]) <= 1.6 * g.body_size)
+        if row_ok and u["ntext"] >= 2:
+            ordered = sorted(text_items, key=lambda it: it.x0)
+            row_ok = all(b.x0 - a.x1 < 1.2 * g.body_size for a, b in zip(ordered, ordered[1:]))
+        if row_ok:
+            rls = [raw_lines.get((round(it.x0, 1), round(it.y0, 1), round(it.x1, 1), round(it.y1, 1)))
+                   for it in sorted(text_items, key=lambda it: it.x0)]
+            if all(rl is not None for rl in rls):
+                words, baseline = [], None
+                for rl in rls:
+                    w, b = _line_words(rl, g)
+                    words += w
+                    baseline = baseline if baseline is not None else b
+                leaders = any(re.fullmatch(r"[.\s]{3,}", w["text"]) for w in words) or \
+                    sum(1 for w in words if w["text"] == ".") >= 3
+                u["leaders"] = leaders
+                if words and not leaders and all(w["max_size"] <= g.body_size + 0.6 for w in words):
                     u["words"], u["baseline"] = words, baseline
         units.append(u)
+        c_items[id(u)] = c["items"]
+
+    if units:
+        units[0]["first_on_page"] = True
+    # consecutive code lines (mono-dominant, close together) form one block that is
+    # kept on a page when it fits; frames are irrelevant, blank lines are not breaks
+    def is_code(u):
+        if u["ntext"] == 0:
+            return False
+        # ignore gutter glyphs (line numbers, wrap arrows) when judging the row,
+        # unless the row is nothing but short tokens such as "}" or ")"
+        texts = [it for it in c_items[id(u)] if it.is_text]
+        wide = [it for it in texts if (it.x1 - it.x0) >= 2 * g.body_size] or texts
+        fonts = [line_fonts.get((round(it.x0, 1), round(it.y0, 1)), (0, ""))[1] for it in wide]
+        return bool(fonts) and sum("Mono" in f for f in fonts) * 2 >= len(fonts)
+    def is_gutter(u):
+        # a blank code line in a numbered listing is just its tiny line number
+        return u["ntext"] == 1 and (u["y1"] - u["y0"]) < 0.8 * g.body_size and \
+            all((it.x1 - it.x0) < 2 * g.body_size for it in c_items[id(u)])
+    run = None
+    for i, u in enumerate(units):
+        prev = units[i - 1] if i else None
+        in_run = prev is not None and (is_code(prev) or (prev.get("group") is not None and is_gutter(prev)))
+        # blank lines inside a listing are about one line pitch; allow 2.5
+        if (is_code(u) or (in_run and is_gutter(u))) and in_run and u["y0"] - prev["y1"] < 2.5 * g.line_pitch:
+            if prev.get("group") is None:
+                run = run or (pno, "code", prev["y0"])
+                prev["group"] = run
+            u["group"] = prev["group"]
+        else:
+            run = None
+    for u in units:
+        u["mono"] = is_code(u)
+        if u.get("group") is not None:
+            u["words"] = None                          # code is never re-wrapped
+    # table-of-contents pages (many dot-leader lines) are never re-wrapped
+    if len(re.findall(r"(?:\.\s){4,}", page.get_text())) >= 5:
+        for u in units:
+            u["words"] = None
 
     # Real ink right-edge of single-line units (text bboxes are noisy on justified lines).
     pix = page.get_pixmap(dpi=72, colorspace="gray")
@@ -386,6 +474,8 @@ def build_units(page, g: Geometry, usable_h: float, note_scale: float, keep_note
     if keep_notes and g.has_margin:
         nclusters = cluster(margin, gap_tol=g.line_gap + 1.5, max_h=usable_h / note_scale * 0.6)
         for c, (top, bot) in zip(nclusters, _bands(nclusters, 2.0, 2.0, g.header_y)):
+            if all(it.is_text and (it.x1 - it.x0) < g.body_size for it in c["items"]):
+                continue                               # a stray glyph in the margin, not a note
             top, bot = max(top, c["y0"] - 2.0), min(bot, c["y1"] + 2.0)
             subs = cluster(c["items"], gap_tol=0.0, max_h=4 * g.body_size)
             bands = _bands(subs, 0, 0, g.header_y) if subs else []
@@ -401,7 +491,7 @@ def build_units(page, g: Geometry, usable_h: float, note_scale: float, keep_note
     return units, notes
 
 
-BULLET_RE = re.compile(r"^([•◦▪–—\-*·]|\(?[0-9a-zA-Z]{1,3}[.)])$")
+BULLET_RE = re.compile(r"^([•◦▪–—\-*·]|\(?(\d{1,3}|[a-zA-Z]|[ivxIVX]{1,4})[.)])$")   # •, 1., (a), iv.
 
 
 def _is_end(u, nxt, g: Geometry, bullet: bool, body_x: float, hanging: bool) -> bool:
@@ -417,11 +507,13 @@ def _is_end(u, nxt, g: Geometry, bullet: bool, body_x: float, hanging: bool) -> 
             return False                              # rows of one table
         if u["right"] > g.col_r and nxt["right"] > g.col_r:
             return False                              # rows of one wide table
-    if u["ntext"] != 1 or nxt["ntext"] != 1:
+    if (u["ntext"] != 1 and u["words"] is None) or (nxt["ntext"] != 1 and nxt["words"] is None):
         return True                                   # headings, boxes, figures, code
     if same_page and gap > g.line_gap + 2.5:
         return True                                   # vertical space
     short = u["text_x1"] is None or u["text_x1"] < g.text_r - 9
+    if u["words"] and u["words"][-1].get("hyphen"):
+        return False                                  # a hyphenated word continues on the next line
     if u["words"] is None or nxt["words"] is None:
         if u["words"] is None and nxt["words"] is None:
             return short or nxt["x0min"] > g.text_l + 8   # no word data (scale 1.0)
@@ -455,7 +547,7 @@ def mark_paragraphs(units, g: Geometry):
     # tables inside the column: rows with side-by-side cells, plus their deeply
     # indented continuation lines
     for u in units:
-        u["tabular"] = u["ntext"] >= 2
+        u["tabular"] = u["ntext"] >= 2 and u["words"] is None
     changed = True
     while changed:
         changed = False
@@ -510,6 +602,11 @@ def anchor_notes(units, notes, g: Geometry):
             while not units[target]["para_end"] and target + 1 < len(units) and span < 200:
                 span += units[target + 1]["bot"] - units[target + 1]["top"]
                 target += 1
+            grp = units[target].get("group")
+            if grp is not None:
+                # never interrupt a code block: place the note after it
+                while target + 1 < len(units) and units[target + 1].get("group") == grp:
+                    target += 1
         n["after"] = target
 
 
@@ -546,8 +643,9 @@ def reflow(seq, g: Geometry, scale: float):
 def _wrap_paragraph(lines, g: Geometry, s: float):
     total = sum(len(w["text"]) for u in lines for w in u["words"])
     body = sum(w["body_chars"] for u in lines for w in u["words"])
-    if total == 0 or body < 0.5 * total:            # code, math: leave as bands
-        return lines
+    justified = any(u["text_x1"] is not None and u["text_x1"] >= g.text_r - 9 for u in lines)
+    if total == 0 or (body < 0.5 * total and not justified):
+        return lines                                 # code, math: leave as bands
 
     # tokens: (list of (pno, clip rect, baseline), width_src)
     tokens = []
@@ -707,7 +805,7 @@ class Layout:
         top, bot = strip[0]["top"], strip[-1]["bot"]
         left = min(u["left"] for u in strip)
         right = max(u["right"] for u in strip)
-        scale = min(self.scale, g.col_w / (right - left))
+        scale = min([self.scale, g.col_w / (right - left)] + [u["scale"] for u in strip])
         h = (bot - top) * scale
         clip = pymupdf.Rect(left, top, min(right, g.col_r), bot)
         dst = pymupdf.Rect(self.pad, self.y, self.pad + clip.width * scale, self.y + h)
@@ -770,10 +868,47 @@ class Layout:
         self.new_page()
         strip, pending = [], 0.0
         limit = self.out_h - self.pad + 0.01
-        for u in seq:
+        for idx, u in enumerate(seq):
             pno = u["pno"]
             h = self.unit_height(u)
-            if u["type"] in ("main", "line") and self.y + pending + h > limit and (self.y + pending) > self.pad + 0.01:
+            need = h
+            if u.get("heading"):
+                # keep a heading with what follows it: any further headings plus
+                # at least three lines of text, so it never ends a page alone
+                body_lines = 0
+                for nx in seq[idx + 1:idx + 8]:
+                    nh = self.unit_height(nx)
+                    if nx["type"] != "line" and not nx.get("heading"):
+                        # a block (code, figure) follows: ask for three lines' worth of it
+                        need += min(nh, 3 * self.g.line_pitch * self.scale)
+                        break
+                    need += nh
+                    if not nx.get("heading"):
+                        body_lines += 1
+                        if body_lines >= 3:
+                            break
+            prev = seq[idx - 1] if idx else None
+            if u.get("chapter") and u.get("first_on_page") and (self.y + pending) > self.pad + 0.01:
+                need = float("inf")                    # a chapter title opens a new page
+            grp = u.get("group")
+            if grp is not None and not (prev and prev.get("group") == grp):
+                # first line of a split block (code listing): if the whole block fits
+                # on one page, do not let it straddle two
+                gh = 0.0
+                for nx in seq[idx:]:
+                    if nx["type"] == "note":
+                        continue
+                    if nx.get("group") != grp:
+                        break
+                    gh += self.unit_height(nx)
+                if gh <= self.out_h - 2 * self.pad:
+                    need = max(need, gh)
+                else:
+                    need = float("inf")               # taller than a page: start it on a fresh page, then bleed
+                if os.environ.get("KINDLEIFY_DEBUG"):
+                    print(f"group {grp} src_p{pno + 1} gh={gh:.0f} at y={self.y + pending:.0f} limit={limit:.0f} "
+                          f"need={need:.0f} -> {'BREAK' if self.y + pending + need > limit and self.y + pending > self.pad else 'stay'}", file=sys.stderr)
+            if u["type"] in ("main", "line") and self.y + pending + need > limit and (self.y + pending) > self.pad + 0.01:
                 self.flush_strip(strip)
                 strip, pending = [], 0.0
                 self.new_page()
@@ -825,6 +960,20 @@ def convert(src_path, dst_path, device="kindle", aspect=None, pad=8.0, note_scal
         u, n = build_units(page, g, lay.usable_h, note_scale, keep_notes, scale)
         units.extend(u)
         notes.extend(n)
+    # a listing that continues on the next source page is one block, whether the
+    # continuation was split into lines or is small enough to be one atomic unit
+    for a, b in zip(units, units[1:]):
+        if (a.get("group") is not None or a.get("mono")) and b["pno"] == a["pno"] + 1 and b.get("first_on_page") \
+                and (b.get("group") is not None or b.get("mono")) and a.get("group") != b.get("group"):
+            if a.get("group") is None:
+                a["group"] = (a["pno"], "cont", a["y0"])
+            old = b.get("group")
+            if old is None:
+                b["group"] = a["group"]
+            else:
+                for u in units:
+                    if u.get("group") == old:
+                        u["group"] = a["group"]
     anchor_notes(units, notes, g)
     by_after = collections.defaultdict(list)
     for n in notes:
